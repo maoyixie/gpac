@@ -768,7 +768,8 @@ static GF_Err gf_filter_pid_configure(GF_Filter *filter, GF_FilterPid *pid, GF_P
 {
 	u32 i, count;
 	GF_Err e;
-	Bool refire_events=GF_FALSE;
+	Bool is_pid_swap = GF_FALSE;
+	Bool refire_events = GF_FALSE;
 	Bool new_pid_inst=GF_FALSE;
 	Bool remove_filter=GF_FALSE;
 	GF_FilterPidInst *pidinst=NULL;
@@ -878,6 +879,7 @@ static GF_Err gf_filter_pid_configure(GF_Filter *filter, GF_FilterPid *pid, GF_P
 	if (filter->swap_pending) {
 		gf_filter_pid_inst_swap(filter, pidinst);
 		filter->swap_pending = GF_FALSE;
+		is_pid_swap = GF_TRUE;
 	}
 
 	filter->in_connect_err = GF_EOS;
@@ -1212,7 +1214,7 @@ static GF_Err gf_filter_pid_configure(GF_Filter *filter, GF_FilterPid *pid, GF_P
 			pidinst->is_playing = GF_TRUE;
 
 		//new pid instance creating a fanout on an already playing pid: force discarding input packets until we have a PLAY
-		if (new_pid_inst && !filter->is_pid_adaptation_filter && pid->is_playing && pid->nb_pck_sent && (pid->num_destinations>1))
+		if (!is_pid_swap && new_pid_inst && !filter->is_pid_adaptation_filter && pid->is_playing && pid->nb_pck_sent && (pid->num_destinations>1))
 			pidinst->discard_inputs = GF_TRUE;
 	}
 	//once all pid have been (re)connected, update any internal caps
@@ -1558,6 +1560,7 @@ static Bool filter_pid_check_fragment(GF_FilterPid *src_pid, char *frag_name, Bo
 {
 	char *psep;
 	u32 comp_type=0;
+	u32 stream_type=0;
 	Bool is_neg = GF_FALSE;
 	const GF_PropertyEntry *pent;
 	const GF_PropertyEntry *pent_val=NULL;
@@ -1573,7 +1576,7 @@ static Bool filter_pid_check_fragment(GF_FilterPid *src_pid, char *frag_name, Bo
 	if (pent) {
 		u32 matched=0;
 		u32 type=0;
-		u32 ptype = pent->prop.value.uint;
+		stream_type = pent->prop.value.uint;
 
 		if (!strnicmp(frag_name, "audio", 5)) {
 			matched=5;
@@ -1597,22 +1600,22 @@ static Bool filter_pid_check_fragment(GF_FilterPid *src_pid, char *frag_name, Bo
 				pent = gf_filter_pid_get_property_entry(src_pid, GF_PROP_PID_ISOM_HANDLER);
 				if (pent && (pent->prop.value.uint == gf_4cc_parse(frag_name)) ) {
 					matched=4;
-					type = ptype;
+					type = stream_type;
 				}
 			}
 		}
 		//stream is encrypted and desired type is not, get original stream type
-		if ((ptype == GF_STREAM_ENCRYPTED) && type && (type != GF_STREAM_ENCRYPTED) ) {
+		if ((stream_type == GF_STREAM_ENCRYPTED) && type && (type != GF_STREAM_ENCRYPTED) ) {
 			pent = gf_filter_pid_get_property_entry(src_pid, GF_PROP_PID_ORIG_STREAM_TYPE);
-			if (pent) ptype = pent->prop.value.uint;
+			if (pent) stream_type = pent->prop.value.uint;
 		}
 
 		if (matched &&
-			( (!is_neg && (type != ptype)) || (is_neg && (type == ptype)) )
+			( (!is_neg && (type != stream_type)) || (is_neg && (type == stream_type)) )
 		) {
 			//special case: if we request a non-file stream but the pid is a file, we will need a demux to
 			//move from file to A/V/... streams, so we accept any #MEDIA from file streams
-			if (ptype == GF_STREAM_FILE) {
+			if (stream_type == GF_STREAM_FILE) {
 				*prop_not_found = GF_TRUE;
 				return GF_TRUE;
 			}
@@ -1672,17 +1675,29 @@ static Bool filter_pid_check_fragment(GF_FilterPid *src_pid, char *frag_name, Bo
 		}
 	}
 
+	//no prop, no '=' separator this is #PIDNAME addressing not solved in filter_source_id_match
 	if (!psep) {
-		*prop_not_found = GF_TRUE;
-		GF_LOG(GF_LOG_WARNING, GF_LOG_FILTER, ("PID addressing %s not recognized, ignoring and assuming match\n", frag_name ));
-		return GF_TRUE;
+		if (!strcmp(frag_name, src_pid->name)) return GF_TRUE;
+		//if pid is from a source filter (no inputs) of type file, allow further connection as PIDNAME is likely the name of a demuxed PID
+		if ((stream_type == GF_STREAM_FILE) && !src_pid->filter->num_input_pids) {
+			return GF_TRUE;
+		}
+		//otherwise walk up the chain for 1->1 filters and check PID names - this allows using the filename as PIDNAME on demuxed PIDs
+		GF_Filter *src_f = src_pid->filter;
+		if (src_f->num_input_pids==1) {
+			GF_FilterPidInst *pidi = gf_list_get(src_f->input_pids, 0);
+			if (!strcmp(frag_name, pidi->pid->name)) return GF_TRUE;
+			src_f = pidi->pid->filter;
+		}
+		*prop_not_found = GF_FALSE;
+		return GF_FALSE;
 	}
 
 	Bool is_equal = GF_FALSE;
 	Bool use_not_equal = GF_FALSE;
 	GF_PropertyValue prop_val;
 	u32 p4cc = 0;
-	char c=psep[0];
+	char c = psep[0];
 	psep[0] = 0;
 	pent=NULL;
 
@@ -2309,7 +2324,7 @@ static void cache_bundle_free(GF_BundleDesc *b)
 		u32 i;
 		for (i=0; i<b->alloc_caps;i++) {
 			GF_CapBundleDesc *cap = &b->caps[i];
-			if (cap->vals) gf_free(cap->vals);
+			if (cap->vals) gf_free((GF_FilterCapability **)cap->vals);
 		}
 		if (b->caps) gf_free(b->caps);
 	}
@@ -2386,7 +2401,7 @@ static GF_BundleDesc *caps_load_bundle(const GF_FilterRegister *freg, u32 b_idx,
 		}
 		if (bundle_cap->nb_vals >= bundle_cap->alloc_vals) {
 			bundle_cap->alloc_vals += 10;
-			bundle_cap->vals = gf_realloc(bundle_cap->vals, bundle_cap->alloc_vals * sizeof(GF_FilterCapability *));
+			bundle_cap->vals = gf_realloc((GF_FilterCapability **)bundle_cap->vals, bundle_cap->alloc_vals * sizeof(GF_FilterCapability *));
 			if (!bundle_cap->vals) {
 				cache_bundle_free(bundle);
 				return NULL;
@@ -4298,15 +4313,34 @@ static Bool gf_filter_pid_needs_explicit_resolution(GF_FilterPid *pid, GF_Filter
 	caps = dst->forced_caps ? dst->forced_caps : dst->freg->caps;
 	nb_caps = dst->forced_caps ? dst->nb_forced_caps : dst->freg->nb_caps;
 
+	s32 out_stream_type=0;
 	for (i=0; i<nb_caps; i++) {
 		const GF_FilterCapability *cap = &caps[i];
-		if (!(cap->flags & GF_CAPFLAG_INPUT)) continue;
+		//for implicit filter, check if output stream type differs from PID stream type
+		if (!(dst->freg->flags & GF_FS_REG_EXPLICIT_ONLY)
+			&& (cap->flags & GF_CAPFLAG_OUTPUT)
+			&& (cap->code == GF_PROP_PID_STREAM_TYPE)
+		) {
+			switch (cap->val.value.uint) {
+			case GF_STREAM_FILE:
+			case GF_STREAM_ENCRYPTED:
+				break;
+			default:
+				if (!out_stream_type) out_stream_type = cap->val.value.uint;
+				//multiple output types
+				else if (out_stream_type!=cap->val.value.uint) out_stream_type = -1;
+				break;
+			}
+		}
 
+		if (!(cap->flags & GF_CAPFLAG_INPUT)) continue;
 		if (cap->code != GF_PROP_PID_CODECID) continue;
 		if (cap->val.value.uint==GF_CODECID_RAW)
 			dst_has_raw_cid_in = GF_TRUE;
 	}
-
+	//not file, not encrypted and mismatch of stream type, we need explicit filter
+	if ((out_stream_type>0) && (out_stream_type!=stream_type->value.uint))
+		return GF_TRUE;
 
 	for (i=0; i<nb_caps; i++) {
 		const GF_FilterCapability *cap = &caps[i];
